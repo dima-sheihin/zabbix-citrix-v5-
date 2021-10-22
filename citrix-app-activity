@@ -1,0 +1,45 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 10 минут
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+$citrix->LoadCache;
+my %work;
+my @res = $citrix->Get( sets => "ApplicationActivitySummaries", select => "ApplicationId,StartingInstanceCount,CreatedDate", filter => { CreatedDate_last => 600 }, );
+
+foreach my $event ( @res ) {
+  my $ApplicationId = $event->{ApplicationId};
+  if ( (   defined $work{app}{$ApplicationId}->{CreatedDate_unixtime} and $event->{CreatedDate_unixtime} > $work{app}{$ApplicationId}->{CreatedDate_unixtime} ) or
+       ( ! defined $work{app}{$ApplicationId}->{CreatedDate_unixtime} ) ) {
+    $work{app}{$ApplicationId}->{CreatedDate_unixtime}  = $event->{CreatedDate_unixtime};
+    $work{app}{$ApplicationId}->{StartingInstanceCount} = $event->{StartingInstanceCount};
+    }
+  }
+foreach my $ApplicationId ( keys $citrix->{cache}->{app} ) {
+
+  if ( defined $citrix->{cache}->{app}{ $ApplicationId }->{zabbix_host} ) {
+    $work{app}{$ApplicationId}->{zabbix_host} = $citrix->{cache}->{app}{ $ApplicationId }->{zabbix_host};
+    }
+
+  }
+
+foreach my $ApplicationId ( keys $work{app} ) {
+  if ( defined $work{app}{$ApplicationId}->{zabbix_host} ) {
+    $work{sender}{ $work{app}{$ApplicationId}->{zabbix_host}  }{env}{StartingInstanceCount}->{value} = $work{app}{$ApplicationId}->{StartingInstanceCount};
+    }
+  }
+delete $work{app};
+z_sender::zabbix_sender( %work );

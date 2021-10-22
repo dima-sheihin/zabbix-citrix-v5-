@@ -1,0 +1,83 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 5 минут
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+$citrix->LoadCache;
+my %work;
+
+my $last = 1200; # 3600
+
+# Обнулим
+foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+  my $zabbix_host = $citrix->{cache}->{dg}{$Id}->{zabbix_host};
+  if ( defined $zabbix_host ) {
+    $work{sender}{$zabbix_host}{env}{MachineFaultUnregistered}->{value}=0;   # 4
+    $work{sender}{$zabbix_host}{env}{MachineFaultNone}->{value}=0;           # 1
+    $work{sender}{$zabbix_host}{env}{MachineFaultStuckOnBoot}->{value}=0;    # 3
+    $work{sender}{$zabbix_host}{env}{MachineFaultUnknown}->{value}=0;        # 0
+    $work{sender}{$zabbix_host}{env}{MachineFaultFailedToStart}->{value}=0;  # 2
+    $work{sender}{$zabbix_host}{env}{MachineFaultMaxCapacity}->{value}=0;    # 5
+    $work{sender}{$zabbix_host}{env}{MachineFault}->{value} = 0;             # Общее
+    $work{sender}{$zabbix_host}{env}{LogMachine}->{value} = "";
+    }
+  }
+
+my @MachineFailureLogs = $citrix->Get( sets => "MachineFailureLogs",filter => { CreatedDate_last => $last, }, time_zone => 'Europe/Moscow', );
+
+foreach my $item ( @MachineFailureLogs ) {
+  my $Id                   = $item->{Id};
+  my $MachineId            = $item->{MachineId};
+  my $MachineName          = $citrix->{cache}->{machines}{ $MachineId }->{HostedMachineName};
+  my $DesktopGroupId       = $citrix->{cache}->{machines}{ $MachineId }->{DesktopGroupId};
+  my $DesktopGroupName     = $citrix->{cache}->{dg}{ $DesktopGroupId }{Name};
+  my $zabbix_host          = $citrix->{cache}->{dg}{ $DesktopGroupId }{zabbix_host};
+  my $LastDeregisteredCode = $item->{LastDeregisteredCode};
+  my $FaultState           = $item->{FaultState};
+  my $FaultStateName       = $citrix->{cache}->{enum}{MachineFaultStateCode}{ $FaultState };
+  my $FailureStartDate     = $item->{FailureStartDate};
+  my $FailureEndDate       = $item->{FailureEndDate};
+  if ( defined $FaultState and defined $zabbix_host                      ) { $work{sender}{$zabbix_host}{env}{MachineFault}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 4 ) { $work{sender}{$zabbix_host}{env}{MachineFaultUnregistered}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 1 ) { $work{sender}{$zabbix_host}{env}{MachineFaultNone}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 3 ) { $work{sender}{$zabbix_host}{env}{MachineFaultStuckOnBoot}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 0 ) { $work{sender}{$zabbix_host}{env}{MachineFaultUnknown}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 2 ) { $work{sender}{$zabbix_host}{env}{MachineFaultFailedToStart}->{value}++; }
+  if ( defined $FaultState and defined $zabbix_host and $FaultState == 5 ) { $work{sender}{$zabbix_host}{env}{MachineFaultMaxCapacity}->{value}++; }
+  }
+
+foreach my $item ( @MachineFailureLogs ) {
+  my $Id                   = $item->{Id};
+  my $MachineId            = $item->{MachineId};
+  my $MachineName          = $citrix->{cache}->{machines}{ $MachineId }->{HostedMachineName};
+  my $DesktopGroupId       = $citrix->{cache}->{machines}{ $MachineId }->{DesktopGroupId};
+  my $DesktopGroupName     = $citrix->{cache}->{dg}{ $DesktopGroupId }{Name};
+  my $zabbix_host          = $citrix->{cache}->{dg}{ $DesktopGroupId }{zabbix_host};
+  my $LastDeregisteredCode = $item->{LastDeregisteredCode};
+  my $FaultState           = $item->{FaultState};
+  my $FaultStateName       = $citrix->{cache}->{enum}{MachineFaultStateCode}{ $FaultState };
+  my $FailureStartDate     = $item->{FailureStartDate};
+  my $FailureEndDate       = $item->{FailureEndDate};
+
+  if ( ! defined $work{sender}{$zabbix_host}{env}{LogMachine} ) {
+    $work{sender}{$zabbix_host}{env}{LogMachine}->{value} = "$MachineName $FaultStateName\\n";
+    }
+  if ( defined $work{sender}{$zabbix_host}{env}{LogMachine} ) {
+    $work{sender}{$zabbix_host}{env}{LogMachine}->{value} .= "$MachineName $FaultStateName\\n";
+    }
+  }
+
+z_sender::zabbix_sender( %work );

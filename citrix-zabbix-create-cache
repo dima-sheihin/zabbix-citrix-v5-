@@ -1,0 +1,129 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use lib '/usr/zabbix-citrix';
+use citrix;
+
+use lib '/usr/zabbix-lib/zabbix-api/';
+use Tiny;
+
+# Период запуска начала часа с понедельника по субботу включительно
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+my $zabbix;
+eval {
+  $zabbix = Zabbix::Tiny->new( server => "http://zabbix-server/api_jsonrpc.php", user => "zabbix-user", password => "zabbix-password" );
+  if ( ! defined $zabbix ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+# Очистим существующий кеш, загрузим с Citrix новые данные
+$citrix->MakeCache;
+
+# Дополним кеш данными с мониторинга нам нужен host-name который нужен для передачи данных в мониторинг
+my %work;
+
+$work{template}->{macro} = '{$MACRO}';
+$work{zabbix}{CitrixApplications}->{template}  = 'Template CitrixApplications';
+$work{zabbix}{CitrixDeliveryGroup}->{template} = 'Template CitrixDeliveryGroup';
+$work{zabbix}{CitrixMachines}->{template}      = 'Template CitrixMachines';
+
+foreach my $system ( keys $work{zabbix} ) {
+  my @hosts = ();
+  # Получим список хостов
+  if ( defined $work{zabbix}{$system}->{template} ) {
+    my $res = shift $zabbix->do( 'template.get', filter => { host => [ $work{zabbix}{$system}->{template} ] }, selectHosts => 1, output => [ qw(hostid) ] );
+    if ( defined $res->{hosts} and $#{$res->{hosts}} >=0 ) {
+      for my $n ( @{$res->{hosts}} ) {
+        if ( defined $n->{hostid} ) {
+          push @hosts, ($n->{hostid});
+          }
+        }
+      }
+    }
+  # Получим макросс ID
+  if ( $#hosts >=0 ) {
+    my $res = $zabbix->do( 'usermacro.get', hostids => [ @hosts ] );
+    if ( defined $res and $#{$res} >=0 ) {
+      for my $host ( @{$res} ) {
+        if ( defined $host->{value} and defined $host->{macro} and $host->{hostid} and $host->{macro} eq $work{template}->{macro} ) {
+          $work{zabbix}{$system}{host}{$host->{hostid}}->{macro} = $host->{value};
+          }
+        }
+      }
+    }
+  # Получим по hostid имя host в мониторинге, с каким именем он там существует
+  if ( $#hosts >=0 ) {
+    my $res = $zabbix->do( 'host.get', hostids => [ @hosts ], output => [ qw(host) ] );
+    if ( defined $res and $#{$res} >=0 ) {
+      for my $host ( @{$res} ) {
+        if ( defined $host->{host} ) {
+          $work{zabbix}{$system}{host}{$host->{hostid}}->{host} = $host->{host};
+          }
+        }
+      }
+    }
+  }
+
+# Сопоставим два массива cache и zabbix в части DeliveryGroup
+
+if ( defined $work{zabbix}{CitrixDeliveryGroup}{host} and ref($work{zabbix}{CitrixDeliveryGroup}{host}) eq 'HASH' and
+     defined $citrix->{cache}->{dg} and ref($citrix->{cache}->{dg}) eq 'HASH' ) {
+  foreach my $hostid ( keys $work{zabbix}{CitrixDeliveryGroup}{host} ) {
+    my $macro = $work{zabbix}{CitrixDeliveryGroup}{host}{ $hostid }->{macro};
+    my $host  = $work{zabbix}{CitrixDeliveryGroup}{host}{ $hostid }->{host};
+    foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+      if ( defined $macro and $host and lc($macro) eq lc($Id) ) {
+        $citrix->{cache}->{dg}{$Id}->{zabbix_host}   = $host;
+        $citrix->{cache}->{dg}{$Id}->{zabbix_hostid} = $hostid;
+        }
+      }
+    }
+  }
+
+# Сопоставим два массива cache и zabbix в части Applications
+
+if ( defined $work{zabbix}{CitrixApplications}{host} and ref($work{zabbix}{CitrixApplications}{host}) eq 'HASH' and
+     defined $citrix->{cache}->{app} and ref($citrix->{cache}->{app}) eq 'HASH' ) {
+  foreach my $hostid ( keys $work{zabbix}{CitrixApplications}{host} ) {
+    my $macro = $work{zabbix}{CitrixApplications}{host}{ $hostid }->{macro};
+    my $host  = $work{zabbix}{CitrixApplications}{host}{ $hostid }->{host};
+    foreach my $Id ( keys $citrix->{cache}->{app} ) {
+      if ( defined $macro and $host and lc($macro) eq lc($Id) ) {
+        $citrix->{cache}->{app}{$Id}->{zabbix_host}   = $host;
+        $citrix->{cache}->{app}{$Id}->{zabbix_hostid} = $hostid;
+        }
+      }
+    }
+  }
+
+# Сопоставим два массива cache и zabbix в части Machines
+
+if ( defined $work{zabbix}{CitrixMachines}{host} and ref($work{zabbix}{CitrixMachines}{host}) eq 'HASH' and
+     defined $citrix->{cache}->{machines} and ref($citrix->{cache}->{machines}) eq 'HASH' ) {
+  foreach my $hostid ( keys $work{zabbix}{CitrixMachines}{host} ) {
+    my $macro = $work{zabbix}{CitrixMachines}{host}{ $hostid }->{macro};
+    my $host  = $work{zabbix}{CitrixMachines}{host}{ $hostid }->{host};
+    foreach my $Id ( keys $citrix->{cache}->{machines} ) {
+      if ( defined $macro and $host and lc($macro) eq lc($Id) ) {
+        $citrix->{cache}->{machines}{$Id}->{zabbix_host}   = $host;
+        $citrix->{cache}->{machines}{$Id}->{zabbix_hostid} = $hostid;
+        }
+      }
+    }
+  }
+
+$citrix->SaveCache;
+$citrix->LoadCache;
+$citrix->ShowCache;

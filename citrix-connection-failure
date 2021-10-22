@@ -1,0 +1,287 @@
+#! /usr/bin/perl
+
+use POSIX;
+use utf8;
+use strict;
+
+use lib '/usr/zabbix-lib/zabbix-api/';
+use Tiny;
+
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 2 минуты
+
+my $zabbix;
+eval {
+  $zabbix = Zabbix::Tiny->new( server => "http://zabbix-server/api_jsonrpc.php", user => "zabbix-user", password => "zabbix-password" );
+  if ( ! defined $zabbix ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+$citrix->LoadCache;
+my %work;
+my $res;
+
+my $last = 1200; # 3600
+
+$work{zabbix}{CitrixConnectionFailureAll}->{template}    = 'Template CitrixConnectionFailure';
+$work{zabbix}{CitrixConnectionFailureAll}->{prefix1}     = 'ConnectionFailure';
+$work{zabbix}{CitrixConnectionFailureAll}->{prefix2}     = '';
+$work{zabbix}{CitrixConnectionFailureAll}->{SessionType} = undef;
+
+$work{zabbix}{CitrixConnectionFailureApp}->{template}    = 'Template CitrixConnectionFailureApplications';
+$work{zabbix}{CitrixConnectionFailureApp}->{prefix1}     = 'ConnectionFailure';
+$work{zabbix}{CitrixConnectionFailureApp}->{prefix2}     = 'App';
+$work{zabbix}{CitrixConnectionFailureApp}->{SessionType} = 1;
+
+$work{zabbix}{CitrixConnectionFailureDesktop}->{template}    = 'Template CitrixConnectionFailureDesktop';
+$work{zabbix}{CitrixConnectionFailureDesktop}->{prefix1}     = 'ConnectionFailure';
+$work{zabbix}{CitrixConnectionFailureDesktop}->{prefix2}     = 'Desktop';
+$work{zabbix}{CitrixConnectionFailureDesktop}->{SessionType} = 0;
+
+foreach my $template ( keys $work{zabbix} ) {
+  my $template_name = $work{zabbix}{$template}->{template};
+  my $hosts = shift $zabbix->do( 'template.get', filter => { host => [ $template_name ] }, selectHosts => 1, output => [ qw(hostid) ] );
+  if ( defined $hosts->{hosts} and $#{$hosts->{hosts}} >=0 ) {
+    for my $n ( @{$hosts->{hosts}} ) {
+      if ( defined $n->{hostid} ) {
+        foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+
+          if ( defined $citrix->{cache}->{dg}{$Id}->{zabbix_hostid} and $citrix->{cache}->{dg}{$Id}->{zabbix_hostid} eq $n->{hostid} ) {
+            # Нашли в кеше DG по hostid
+            $work{zabbix_template_dg}{$Id}{zabbix_host}         = $citrix->{cache}->{dg}{$Id}->{zabbix_host};
+            $work{zabbix_template_dg}{$Id}{template}{$template} = 1;
+            }
+
+          }
+        }
+      }
+    }
+  }
+
+
+# Обнуление метрик, подготавливаем
+foreach my $Id ( keys $work{zabbix_template_dg} ) {
+  my $zabbix_host = $work{zabbix_template_dg}{$Id}{zabbix_host};
+
+  if ( ! defined $zabbix_host ) { next; }
+
+  foreach my $template ( keys $work{zabbix_template_dg}{$Id}{template} ) {
+    my $prefix1 = $work{zabbix}{$template}->{prefix1};
+    my $prefix2 = $work{zabbix}{$template}->{prefix2};
+
+    my $env = $prefix1.$prefix2.'_all';
+    $work{sender}{$zabbix_host}{env}{ $env }->{value}=0;
+
+    foreach my $Value ( keys $citrix->{cache}->{enum}{SessionFailureCode} ) {
+      my $SessionFailureCodeName = $citrix->{cache}->{enum}{SessionFailureCode}{$Value};
+      my $env = $prefix1.$prefix2.$SessionFailureCodeName;
+      $work{sender}{$zabbix_host}{env}{$env}->{value}=0;
+      }
+    }
+  }
+
+# Получим список Failed соединений, за период
+my @ConnectionFailureLogs = $citrix->Get ( sets => "ConnectionFailureLogs",
+                                           filter => { FailureDate_last => $last, },
+                                           time_zone => 'Europe/Moscow',
+                                           select => "Id,CreatedDate,FailureDate,ConnectionFailureEnumValue,SessionKey",
+                                           );
+
+foreach my $item ( @ConnectionFailureLogs ) {
+  $work{failure}{$item->{Id}}{SessionKey}                 = $item->{SessionKey};
+  $work{failure}{$item->{Id}}{CreatedDate}                = $item->{CreatedDate};
+  $work{failure}{$item->{Id}}{ModifiedDate}               = $item->{ModifiedDate};
+  $work{failure}{$item->{Id}}{FailureDate}                = $item->{FailureDate};
+  $work{failure}{$item->{Id}}{ConnectionFailureEnumValue} = $item->{ConnectionFailureEnumValue};
+  $work{failure}{$item->{Id}}{ConnectionFailureEnumName}  = $citrix->{cache}->{enum}{SessionFailureCode}{ $item->{ConnectionFailureEnumValue} };
+  }
+
+if ( ! defined $work{failure} ) {
+  z_sender::zabbix_sender( %work );
+  exit;
+  }
+
+foreach my $failure_Id ( keys $work{failure} ) {
+  my $SessionKey = $work{failure}{ $failure_Id }{SessionKey};
+  if ( ! defined $work{session}{$SessionKey}{CreatedDate} ) {
+    my @Sessions = $citrix->Get ( sets => "Sessions", filter => { SessionKey => $SessionKey, }, select => "SessionKey,MachineId,SessionType,CreatedDate,FailureDate,SessionType,UserId", );
+    foreach my $item ( @Sessions ) {
+      my $SessionKey = $item->{SessionKey};
+      $work{session}{$SessionKey}{CreatedDate}            = $item->{CreatedDate};
+      $work{session}{$SessionKey}{FailureDate}            = $item->{FailureDate};
+      $work{session}{$SessionKey}{MachineId}              = $item->{MachineId};
+      $work{session}{$SessionKey}{SessionType}            = $item->{SessionType};
+      $work{session}{$SessionKey}{User}                   = $citrix->{cache}->{users}{ $item->{UserId} }->{UserName};
+      $work{session}{$SessionKey}{Machine}                = $citrix->{cache}->{machines}{$item->{MachineId}}->{HostedMachineName};
+      $work{session}{$SessionKey}{DesktopGroupId}         = $citrix->{cache}->{machines}{$item->{MachineId}}->{DesktopGroupId};
+      $work{session}{$SessionKey}{DesktopGroupName}       = $citrix->{cache}->{dg}{$work{session}{$SessionKey}{DesktopGroupId}}{Name};
+      $work{session}{$SessionKey}{zabbix_host}            = $citrix->{cache}->{dg}{$work{session}{$SessionKey}{DesktopGroupId}}{zabbix_host};
+      $work{session}{$SessionKey}{SessionTypeName}        = $citrix->{cache}->{enum}{SessionType}{ $item->{SessionType} };
+      $work{session}{$SessionKey}{ConnectionFailureValue} = $work{failure}{$failure_Id}{ConnectionFailureEnumValue};
+      $work{session}{$SessionKey}{ConnectionFailureName}  = $work{failure}{$failure_Id}{ConnectionFailureEnumName};
+
+      # не найден FailureDate, значит нет смысла с сессией работать, она случайно попала
+      if ( ! defined $work{session}{$SessionKey}{FailureDate} ) {
+        $work{session}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      # Не найден DesktopGroupId
+      if ( ! defined $work{session}{$SessionKey}{DesktopGroupId} ) {
+        $work{session}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      # Не найден zabbix_host
+      if ( ! defined $work{session}{$SessionKey}{zabbix_host} ) {
+        $work{session}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      # Не найден DesktopGroupId в присоединенных к zabbix шаблону DG
+      if ( ! defined $work{zabbix_template_dg}{ $work{session}{$SessionKey}{DesktopGroupId} } ) {
+        $work{session}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      }
+    }
+  }
+
+# Уберем лишнее failure
+foreach my $failure_Id ( keys $work{failure} ) {
+  if ( defined $work{failure}{$failure_Id}{delete} ) {
+    delete $work{failure}{$failure_Id};
+    }
+  }
+
+# Уберем лишнее session
+foreach my $SessionKey ( keys $work{session} ) {
+  if ( defined $work{session}{$SessionKey}{delete} ) {
+    delete $work{session}{$SessionKey};
+    }
+  }
+
+if ( ! defined $work{failure} ) {
+  z_sender::zabbix_sender( %work );
+  exit;
+  }
+
+if ( ! defined $work{session} ) {
+  z_sender::zabbix_sender( %work );
+  exit;
+  }
+
+
+# Обнуление метрик, подготавливаем
+foreach my $Id ( keys $work{zabbix_template_dg} ) {
+  my $zabbix_host = $work{zabbix_template_dg}{$Id}{zabbix_host};
+
+  if ( ! defined $zabbix_host ) { next; }
+
+  foreach my $template ( keys $work{zabbix_template_dg}{$Id}{template} ) {
+    my $prefix1 = $work{zabbix}{$template}->{prefix1};
+    my $prefix2 = $work{zabbix}{$template}->{prefix2};
+
+    my $env = $prefix1.$prefix2.'_all';
+    $work{sender}{$zabbix_host}{env}{ $env }->{value}=0;
+
+    foreach my $Value ( keys $citrix->{cache}->{enum}{SessionFailureCode} ) {
+      my $SessionFailureCodeName = $citrix->{cache}->{enum}{SessionFailureCode}{$Value};
+      my $env = $prefix1.$prefix2.$SessionFailureCodeName;
+      $work{sender}{$zabbix_host}{env}{$env}->{value}=0;
+      }
+    }
+  }
+
+
+# Получим Connections по интересным для нас сессиям
+foreach my $SessionKey ( keys $work{session} ) {
+  my @Connections = $citrix->Get ( sets => "Connections", filter => { SessionKey => $SessionKey }, select => "Id,SessionKey,LogOnStartDate,LogOnEndDate,BrokeringDate,BrokeringDuration,HdxStartDate,HdxEndDate,ProfileLoadStartDate,ProfileLoadEndDate,GpoStartDate,GpoEndDate,LogOnScriptsStartDate,LogOnScriptsEndDate,InteractiveStartDate,InteractiveEndDate,VMStartStartDate,VMStartEndDate,EstablishmentDate,DisconnectCode,DisconnectDate,CreatedDate,ModifiedDate" );
+  foreach my $item ( @Connections ) {
+    my $Id = $item->{Id};
+    foreach my $i ( keys %{$item} ) {
+      if ( defined $item->{ $i } ) {
+        $work{connection}{ $Id }{ $i } = $item->{$i};
+        }
+      }
+    push @{ $work{session}{$SessionKey}{connection} }, $Id;
+    }
+  }
+
+foreach my $SessionKey ( keys $work{session} ) {
+  my $CreatedDate      = $work{session}{$SessionKey}{CreatedDate};
+  my $FailureDate      = $work{session}{$SessionKey}{FailureDate};
+  my $User             = $work{session}{$SessionKey}{User};
+  my $MachineId        = $work{session}{$SessionKey}{MachineId};
+  my $Machine          = $work{session}{$SessionKey}{Machine};
+  my $zabbix_host      = $work{session}{$SessionKey}{zabbix_host};
+  my $DesktopGroupId   = $work{session}{$SessionKey}{DesktopGroupId};
+  my $DesktopGroupName = $work{session}{$SessionKey}{DesktopGroupName};
+  my $SessionType      = $work{session}{$SessionKey}{SessionType};
+  my $SessionTypeName  = $work{session}{$SessionKey}{SessionTypeName};
+
+  my $ConnectionFailureValue = $work{session}{$SessionKey}{ConnectionFailureValue};
+  my $ConnectionFailureName  = $work{session}{$SessionKey}{ConnectionFailureName};
+
+  if ( ! defined $zabbix_host ) { next; }
+  if ( ! defined $ConnectionFailureName ) { next; }
+
+
+  if ( defined $work{session}{$SessionKey}{connection} ) {
+    my @connection = @{$work{session}{$SessionKey}{connection}};
+    foreach my $Id ( @connection ) {
+      my $CreatedDate    = $work{connection}{ $Id }{CreatedDate};
+      my $LogOnStartDate = $work{connection}{ $Id }{LogOnStartDate};
+
+
+      if ( defined $SessionType and $SessionType == 0 ) {
+        my $prefix1 = $work{zabbix}{CitrixConnectionFailureDesktop}->{prefix1};
+        my $prefix2 = $work{zabbix}{CitrixConnectionFailureDesktop}->{prefix2};
+
+        my $env = $prefix1.$prefix2.$ConnectionFailureName;
+        $work{sender}{$zabbix_host}{env}{$env}->{value}++;
+
+        my $env_all = $prefix1.$prefix2.'_all';
+        $work{sender}{$zabbix_host}{env}{ $env_all }->{value}++;
+        }
+
+      if ( defined $SessionType and $SessionType == 1 ) {
+        my $prefix1 = $work{zabbix}{CitrixConnectionFailureApp}->{prefix1};
+        my $prefix2 = $work{zabbix}{CitrixConnectionFailureApp}->{prefix2};
+
+        my $env = $prefix1.$prefix2.$ConnectionFailureName;
+        $work{sender}{$zabbix_host}{env}{$env}->{value}++;
+
+        my $env_all = $prefix1.$prefix2.'_all';
+        $work{sender}{$zabbix_host}{env}{ $env_all }->{value}++;
+
+        }
+
+      my $prefix1 = $work{zabbix}{CitrixConnectionFailureAll}->{prefix1};
+      my $prefix2 = $work{zabbix}{CitrixConnectionFailureAll}->{prefix2};
+      my $env = $prefix1.$prefix2.$ConnectionFailureName;
+      $work{sender}{$zabbix_host}{env}{$env}->{value}++;
+
+      my $env_all = $prefix1.$prefix2.'_all';
+      $work{sender}{$zabbix_host}{env}{ $env_all }->{value}++;
+      }
+
+    }
+  }
+
+z_sender::zabbix_sender( %work );

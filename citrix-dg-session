@@ -1,0 +1,59 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 2 минуты
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+$citrix->LoadCache;
+my %work;
+
+my @res = $citrix->Get( sets => "SessionActivitySummaries",
+                        select => "DesktopGroupId,ConnectedSessionCount,DisconnectedSessionCount,ConcurrentSessionCount,CreatedDate",
+                        filter => { CreatedDate_last => 600},
+                        );
+
+foreach my $event ( @res ) {
+  my $Id = $event->{DesktopGroupId};
+  if ( ( defined $work{dg}{$Id}->{CreatedDate_unixtime} and $event->{CreatedDate_unixtime} > $work{dg}{$Id}->{CreatedDate_unixtime} ) or ( ! defined $work{dg}{$Id}->{CreatedDate_unixtime} ) ) {
+    $work{dg}{ $Id }->{CreatedDate_unixtime}     = $event->{CreatedDate_unixtime};
+    $work{dg}{ $Id }->{ConnectedSessionCount}    = $event->{ConnectedSessionCount};
+    $work{dg}{ $Id }->{DisconnectedSessionCount} = $event->{DisconnectedSessionCount};
+    $work{dg}{ $Id }->{ConcurrentSessionCount}   = $event->{ConcurrentSessionCount};
+    }
+    
+  }
+
+foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+  if ( ! defined $work{dg}{$Id}->{ConnectedSessionCount} ) {
+    $work{dg}{$Id}->{CreatedDate_unixtime}     = 0;
+    $work{dg}{$Id}->{ConnectedSessionCount}    = 0;
+    $work{dg}{$Id}->{DisconnectedSessionCount} = 0;
+    $work{dg}{$Id}->{ConcurrentSessionCount}   = 0;
+    }
+  $work{dg}{$Id}->{zabbix_host} = $citrix->{cache}->{dg}{ $Id }->{zabbix_host};
+  }
+
+foreach my $Id ( keys $work{dg} ) {
+  
+  if ( length($work{dg}{$Id}->{zabbix_host}) < 2 ) { next; }
+  
+  $work{sender}{ $work{dg}{$Id}->{zabbix_host}  }{env}{ConnectedSessionCount}->{value}    = $work{dg}{$Id}->{ConnectedSessionCount};
+  $work{sender}{ $work{dg}{$Id}->{zabbix_host}  }{env}{DisconnectedSessionCount}->{value} = $work{dg}{$Id}->{DisconnectedSessionCount};
+  $work{sender}{ $work{dg}{$Id}->{zabbix_host}  }{env}{ConcurrentSessionCount}->{value}   = $work{dg}{$Id}->{ConcurrentSessionCount};
+  }
+delete $work{app};
+
+
+z_sender::zabbix_sender( %work );

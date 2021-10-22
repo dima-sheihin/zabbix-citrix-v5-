@@ -1,0 +1,348 @@
+#! /usr/bin/perl
+
+use POSIX;
+use utf8;
+use strict;
+use citrix;
+
+use lib '/usr/zabbix-lib/zabbix-api/';
+use Tiny;
+
+# Период запуска начала часа с понедельника по субботу включительно
+
+#exit;
+
+my %work;
+my $res;
+
+$work{template}->{macro} = '{$MACRO}';
+
+$work{zabbix}{CitrixApplications}->{template}           = 'Template CitrixApplications';
+$work{zabbix}{CitrixApplications}->{templateid}         = undef;
+$work{zabbix}{CitrixApplications}->{hostgroup}          = 'CitrixApplications';
+$work{zabbix}{CitrixApplications}->{hostgroupid}        = undef;
+$work{zabbix}{CitrixApplications}->{citrix_set}         = 'Applications';
+$work{zabbix}{CitrixApplications}->{citrix_prefix}      = 'CitrixApp';
+$work{zabbix}{CitrixApplications}->{citrix_select}      = 'Id,Name';
+$work{zabbix}{CitrixApplications}->{citrix_select_Name} = 'Name';
+
+$work{zabbix}{CitrixDeliveryGroup}->{template}           = 'Template CitrixDeliveryGroup';
+$work{zabbix}{CitrixDeliveryGroup}->{templateid}         = undef;
+$work{zabbix}{CitrixDeliveryGroup}->{hostgroup}          = 'CitrixDeliveryGroup';
+$work{zabbix}{CitrixDeliveryGroup}->{hostgroupid}        = undef;
+$work{zabbix}{CitrixDeliveryGroup}->{citrix_set}         = 'DesktopGroups';
+$work{zabbix}{CitrixDeliveryGroup}->{citrix_prefix}      = 'CitrixDG';
+$work{zabbix}{CitrixDeliveryGroup}->{citrix_select}      = 'Id,Name';
+$work{zabbix}{CitrixDeliveryGroup}->{citrix_select_Name} = 'Name';
+
+$work{zabbix}{CitrixMachines}->{template}           = 'Template CitrixMachines';
+$work{zabbix}{CitrixMachines}->{templateid}         = undef;
+$work{zabbix}{CitrixMachines}->{hostgroup}          = 'CitrixMachines';
+$work{zabbix}{CitrixMachines}->{hostgroupid}        = undef;
+$work{zabbix}{CitrixMachines}->{citrix_set}         = 'Machines';
+$work{zabbix}{CitrixMachines}->{citrix_prefix}      = 'CitrixHost';
+$work{zabbix}{CitrixMachines}->{citrix_select}      = 'Id,Name,HostedMachineName';
+$work{zabbix}{CitrixMachines}->{citrix_select_Name} = 'HostedMachineName';
+
+# Создание хоста
+$work{create}->{interfaces}{0}->{ip}    = '127.0.0.1'; #
+$work{create}->{interfaces}{0}->{dns}   = '';          #
+$work{create}->{interfaces}{0}->{useip} = 1;           # 0 - подключение по DNS имени; 1 - подключение по IP адресу
+$work{create}->{interfaces}{0}->{port}  = 10050;       #
+$work{create}->{interfaces}{0}->{type}  = 1;           # 1 - агент; 2 - SNMP; 3 - IPMI; 4 - JMX
+$work{create}->{interfaces}{0}->{main}  = 1;           # 0 - не по умолчанию; 1 - по умолчанию
+
+$work{create}->{z_proxy}->{name}        = undef;  # Имя прокси сервера
+$work{create}->{z_proxy}->{id}          = undef;
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+my $zabbix;
+eval {
+  $zabbix = Zabbix::Tiny->new( server => "http://zabbix-server/api_jsonrpc.php", user => "zabbix-user", password => "zabbix-password" );
+  if ( ! defined $zabbix ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+foreach my $system ( keys $work{zabbix} ) {
+  my @hosts = ();
+  my $res;
+
+  # Определим ID template
+  if ( defined $work{zabbix}{$system}->{template} ) {
+    $res = shift $zabbix->do( 'template.get', filter => { host => [ $work{zabbix}{$system}->{template} ] }, output => [ qw(templateid) ], );
+    if ( defined $res->{templateid} ) {
+      $work{zabbix}{$system}->{templateid} = $res->{templateid};
+      }
+    }
+
+  # Определим ID hostgroup
+  if ( defined $work{zabbix}{$system}->{hostgroup} ) {
+    $res = shift $zabbix->do( 'hostgroup.get', filter => { name => [ $work{zabbix}{$system}->{hostgroup} ] }, output => [ qw(groupid) ], );
+    if ( defined $res->{groupid} ) {
+      $work{zabbix}{$system}->{hostgroupid} = $res->{groupid};
+      }
+    }
+
+  # Проверим
+  if ( ! defined $work{zabbix}{$system}->{templateid} or ! defined $work{zabbix}{$system}->{hostgroupid} ) {
+    print "Error get hostgroup ID or template ID, from zabbix server, exit\n";
+    next;
+    }
+
+  # Получим список хостов hostid
+  $res = shift $zabbix->do( 'template.get', templateids => [ $work{zabbix}{$system}->{templateid} ], selectHosts => 1, output => [ qw(hostid) ] );
+  if ( defined $res->{hosts} and $#{$res->{hosts}} >=0 ) {
+    for my $n ( @{$res->{hosts}} ) {
+      if ( defined $n->{hostid} ) {
+        push @hosts, ($n->{hostid});
+        }
+      }
+    }
+
+  # Получим макросс ID
+  if ( $#hosts >=0 ) {
+    my $res = $zabbix->do( 'usermacro.get', hostids => [ @hosts ] );
+    if ( defined $res and $#{$res} >=0 ) {
+      for my $host ( @{$res} ) {
+        if ( defined $host->{value} and defined $host->{macro} and $host->{hostid} and $host->{macro} eq $work{template}->{macro} ) {
+          $work{zabbix}{$system}{zabbix_host}{$host->{hostid}}->{macro} = $host->{value};
+          }
+        }
+      }
+    }
+
+  # Получим по hostid имя host
+  if ( $#hosts >=0 ) {
+    my $res = $zabbix->do( 'host.get', hostids => [ @hosts ], output => [ qw(host) ] );
+    if ( defined $res and $#{$res} >=0 ) {
+      for my $host ( @{$res} ) {
+        if ( defined $host->{host} ) {
+          $work{zabbix}{$system}{zabbix_host}{$host->{hostid}}->{host} = $host->{host};
+          }
+        }
+      }
+    }
+
+  # Получим сущьности с API Citrix
+  my $citrix_set         = $work{zabbix}{$system}->{citrix_set};
+  my $citrix_prefix      = $work{zabbix}{$system}->{citrix_prefix};
+  my $citrix_select      = $work{zabbix}{$system}->{citrix_select};
+  my $citrix_select_Name = $work{zabbix}{$system}->{citrix_select_Name};
+
+  delete $work{tmp};
+
+  if ( defined $citrix_set and defined $citrix_prefix and defined $citrix_select and defined $citrix_select_Name) {
+
+    my @res = $citrix->Get ( sets => $citrix_set, select => $citrix_select );
+    if ( scalar ($#res) >= 0 ) {
+
+
+      foreach my $item ( @res ) {
+        #
+        my $vserver = $item->{Id};
+        my $Name    = $item->{$citrix_select_Name};
+        if ( ! defined $Name ) {
+          print "system [$system] no set name vserver [$vserver], ($item->{Name}) skip\n";
+          next;
+          }
+        my @row_tmp = split( //, $Name );
+        $Name = "";
+        foreach my $d ( @row_tmp ) {
+          if ( $d =~ /[a-zA-Z0-9,\.,\@,\[,\],\>,\<,\ ,\",\-,\:,\_,\/,\%,\!,\*,\~,\(,\),\,\\,\?,\=]/ ) {
+            $Name .= $d;
+            }
+          }
+        $Name = "$citrix_prefix\_$Name";
+        $Name =~ (s/\s{1,}//);
+        my $Name_new = undef;
+        if ( defined $work{tmp}{vserver}{$Name}->{name} )     { $Name_new = "$Name-1"; }
+        if ( defined $work{tmp}{vserver}{$Name_new}->{name} ) { $Name_new = "$Name-2"; }
+        if ( defined $work{tmp}{vserver}{$Name_new}->{name} ) { $Name_new = "$Name-3"; }
+        if ( defined $work{tmp}{vserver}{$Name_new}->{name} ) { $Name_new = "$Name-4"; }
+        if ( defined $work{tmp}{vserver}{$Name_new}->{name} ) { $Name_new = "$Name-5"; }
+        if ( defined $work{tmp}{vserver}{$Name_new}->{name} ) {
+          print "system [$system] cannot set name vserver [$Name] id [$vserver], skip\n";
+          next;
+          }
+        if ( ! defined $Name_new ) {
+          $Name_new = $Name;
+          }
+
+        $work{zabbix}{$system}{citrix_vserver}{$vserver}->{name} = $Name_new;
+        $work{tmp}{vserver}{$Name_new}->{name}=1;
+        }
+      }
+    }
+
+  # Нет ни одной виртуальной сущьности в Citrix
+  if ( scalar keys %{ $work{zabbix}{$system}{citrix_vserver} } == 0 ) {
+    print "system [$system] no virtual server, skip system\n";
+    next;
+    }
+
+  # В обоих структурах zabbix и citrix есть хосты которые есть и там и там, найдм их и отмаркируем
+  foreach my $vserver ( keys %{ $work{zabbix}{$system}{citrix_vserver} } ) {
+    foreach my $hostid ( keys %{ $work{zabbix}{$system}{zabbix_host} } ) {
+      my $zabbix_macro = $work{zabbix}{$system}{zabbix_host}{$hostid}->{macro};
+      if ( defined $vserver and defined $zabbix_macro and lc($vserver) eq lc($zabbix_macro) ) {
+        $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} = "hostfound";
+        $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} = "hostfound";
+        }
+      }
+    }
+
+  # Если в структуре zabbix не нашлись хосты, значит их нужно удалить
+  foreach my $hostid ( keys %{ $work{zabbix}{$system}{zabbix_host} } ) {
+    if ( ! defined $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} ) {
+      $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} = "hostdelete";
+      }
+    }
+
+  # Если в структуре Citrix не нашлись некоторые хосты, значит это новые хосты которые нужно создать в zabbix
+  foreach my $vserver ( keys %{ $work{zabbix}{$system}{citrix_vserver} } ) {
+    if ( ! defined $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} ) {
+      $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} = "hostcreate";
+      }
+    }
+
+  # Удаление хостов из мониторинга, будет происходить только в том случае если нашлись хосты hostfound и нашлись хосты hostdelete
+  # С целью исключения случайного удаления всех хостов из мониторинга присоединенных к шаблону
+  my $flag_hostdelete = undef;
+  my $flag_hostfound  = undef;
+  foreach my $hostid ( keys %{$work{zabbix}{$system}{zabbix_host}} ) {
+    if ( defined $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} and $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} eq "hostdelete" ) {
+      $flag_hostdelete++;
+      }
+    if ( defined $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} and $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} eq "hostfound" ) {
+      $flag_hostfound++;
+      }
+    }
+
+  # Процесс удаления хоста(в)
+  if ( defined $flag_hostdelete and defined $flag_hostfound ) {
+    foreach my $hostid ( keys %{ $work{zabbix}{$system}{zabbix_host} } ) {
+      if ( defined $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} and $work{zabbix}{$system}{zabbix_host}{$hostid}->{result} eq "hostdelete" ) {
+        my @del;
+        push @del, $hostid;
+        push @del, $hostid;
+        print "system [$system] host delete $hostid\n";
+        my $delete = $zabbix->do( 'host.delete' , @del );
+        }
+      }
+    }
+
+  # Перед началом создания хостов:
+
+  # Определить ID прокси сервера, учитываем что прокси сервера может и не быть
+  if ( defined $work{create}->{z_proxy}->{name} ) {
+    my $res = shift $zabbix->do( 'proxy.get', filter => { host => [ $work{create}->{z_proxy}->{name} ] }, output => [ qw(proxyid) ], );
+    if ( defined $res->{proxyid} ) {
+      $work{create}->{z_proxy}->{id} = $res->{proxyid};
+      }
+    if ( defined $work{create}->{z_proxy}->{name} and ! defined $work{create}->{z_proxy}->{id} ) {
+      # Имя прокси сервера есть, но ID определить не удалось, сообщим и выдем
+      print "Error get zabbix proxy ID, from zabbix server, exit\n";
+      exit;
+      }
+    }
+
+  # Убедимся что в мониторинге нет точно таких же хостов с тем же именем
+  foreach my $vserver ( keys %{ $work{zabbix}{$system}{citrix_vserver} } ) {
+    if ( defined $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} and $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} eq "hostcreate") {
+      my $vserver_name = $work{zabbix}{$system}{citrix_vserver}{$vserver}->{name};
+
+      my $hostid  = shift $zabbix->do( 'host.get', filter => { host => [ $vserver_name ] }, output => [ qw(hostid) ] );
+      if ( ! defined $hostid ) {
+        $work{zabbix}{$system}{citrix_vserver}{$vserver}->{zabbix_host} = $vserver_name;
+        }
+      else {
+        # Имя нашлось, прибавляем _1 и проверяем
+        print "error test check host $vserver_name\n";
+        my $vserver_name_1 = $vserver_name . "_1";
+        my $hostid_1  = shift $zabbix->do( 'host.get', filter => { host => [ $vserver_name_1 ] }, output => [ qw(hostid) ] );
+        if ( ! defined $hostid_1 ) {
+          $work{zabbix}{$system}{citrix_vserver}{$vserver}->{zabbix_host} = $vserver_name_1;
+          }
+        else {
+          # Имя нашлось, прибавляем _2 и проверяем
+          print "error test check host $vserver_name and $vserver_name_1\n";
+          my $vserver_name_2 = $vserver_name."_2";
+          my $hostid_2  = shift $zabbix->do( 'host.get', filter => { host => [ $vserver_name_2 ] }, output => [ qw(hostid) ] );
+          if ( ! defined $hostid_2 ) {
+            $work{zabbix}{$system}{citrix_vserver}{$vserver}->{zabbix_host} = $vserver_name_2;
+            }
+          else {
+            print "error test check host $vserver_name and $vserver_name_1 and $vserver_name_2\n";
+            }
+          }
+        }
+      }
+    }
+
+  # Создадим массив с интерфейсами, при создании новых хостов настройки сетевых интерфейсов одинаковые
+  my @interfaces = ();
+  foreach my $id ( sort keys %{ $work{create}->{interfaces} } ) {
+    my $ip    = $work{create}->{interfaces}{$id}->{ip};
+    my $dns   = $work{create}->{interfaces}{$id}->{dns};
+    my $useip = $work{create}->{interfaces}{$id}->{useip};
+    my $port  = $work{create}->{interfaces}{$id}->{port};
+    my $type  = $work{create}->{interfaces}{$id}->{type};
+    my $main  = $work{create}->{interfaces}{$id}->{main};
+    push @interfaces , { type=> $type, main=> $main, useip=> $useip, ip=> $ip, dns=> $dns, port=> $port, };
+    }
+
+  # Создание хоста
+  my $macro       = $work{template}->{macro};
+  my $z_proxy_id  = $work{create}->{z_proxy}->{id};
+  my $hostgroup   = $work{zabbix}{$system}->{hostgroupid};
+  my $template    = $work{zabbix}{$system}->{templateid};
+
+  foreach my $vserver ( keys %{ $work{zabbix}{$system}{citrix_vserver} } ) {
+    my $zabbix_host = $work{zabbix}{$system}{citrix_vserver}{$vserver}->{zabbix_host};
+    if ( defined $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} and
+         $work{zabbix}{$system}{citrix_vserver}{$vserver}->{result} eq "hostcreate" and
+         defined $zabbix_host ) {
+
+      # пауза перед самим созданием, бывало что API zabbix и zabbix core не успевало, и тогда путались ID хостов и метрик
+      select(undef,undef,undef, 0.20);
+
+      $zabbix_host =~ (s/\#//g);
+      $zabbix_host =~ (s/\://g);
+      my $host_create;
+      if ( defined $z_proxy_id ) {
+        $host_create = $zabbix->do( 'host.create', host => $zabbix_host,
+                                                   interfaces => \@interfaces,
+                                                   groups => [ { groupid => $hostgroup } ],
+                                                   templates => [ { templateid => $template } ],
+                                                   macros => [ { macro => $macro, value => $vserver }, ],
+                                                   proxy_hostid => $z_proxy_id  );
+        }
+      if ( ! defined $z_proxy_id ) {
+        $host_create = $zabbix->do( 'host.create', host => $zabbix_host,
+                                                   interfaces => \@interfaces,
+                                                   groups => [ { groupid => $hostgroup } ],
+                                                   templates => [ { templateid => $template } ],
+                                                   macros => [ { macro => $macro, value => $vserver }, ],  );
+        }
+      if ( defined $host_create ) {
+        my $hostids = ( shift $host_create->{hostids} );
+        print "New host ID $hostids hosts [$zabbix_host]\n";
+        }
+      else {
+        print "Error create hosts [$zabbix_host]\n";
+        }
+      }
+    }
+
+
+  }

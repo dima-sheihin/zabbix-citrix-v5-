@@ -1,0 +1,47 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 2 минуты
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+$citrix->LoadCache;
+
+my %work;
+
+my @res = $citrix->Get( sets => "DesktopOSDesktopSummaries", select => "DesktopGroupId,CreatedDate,StartingInstanceCount", filter => { CreatedDate_last => 600}, );
+foreach my $event ( @res ) {
+  my $Id = $event->{DesktopGroupId};
+  if ( (   defined $work{dg}{$Id}->{CreatedDate_unixtime} and $event->{CreatedDate_unixtime} > $work{dg}{$Id}->{CreatedDate_unixtime} ) or
+       ( ! defined $work{dg}{$Id}->{CreatedDate_unixtime} ) ) {
+    $work{dg}{$Id}->{CreatedDate_unixtime}    = $event->{CreatedDate_unixtime};
+    $work{dg}{$Id}->{StartingInstanceCount}   = $event->{StartingInstanceCount};
+    }
+  }
+foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+  if ( ! defined $work{dg}{$Id}->{StartingInstanceCount} ) {
+    $work{dg}{$Id}->{StartingInstanceCount} = 0;
+    }
+  $work{dg}{$Id}->{zabbix_host} = $citrix->{cache}->{dg}{$Id}->{zabbix_host};
+  }
+foreach my $Id ( keys $work{dg} ) {
+  
+  if ( length($work{dg}{$Id}->{zabbix_host}) < 2 ) { next; }
+  
+  $work{sender}{$work{dg}{$Id}->{zabbix_host}}{env}{DesktopStartingInstanceCount}->{value} = $work{dg}{$Id}->{StartingInstanceCount};
+  }
+delete $work{app};
+
+z_sender::zabbix_sender( %work );

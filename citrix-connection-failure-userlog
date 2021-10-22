@@ -1,0 +1,324 @@
+#! /usr/bin/perl
+
+use utf8;
+use strict;
+use Data::Dumper qw(Dumper);
+
+use lib '/usr/zabbix-citrix/';
+use citrix;
+require z_sender;
+
+# Период запуска каждые 2 минуты
+
+my $citrix;
+eval {
+  $citrix = citrix->new();
+  if ( ! defined $citrix->init() ) {
+    print "fatal, exit\n";
+    exit;
+    }
+  };
+
+$citrix->LoadCache;
+my %work = ();
+
+my $last = 1200; # 3600
+
+my $all_last = 86400;
+
+# Получим список Failed соединений, за период
+my @ConnectionFailureLogs = $citrix->Get ( sets => "ConnectionFailureLogs",
+                                           filter => { FailureDate_last => $last, },
+                                           time_zone => 'Europe/Moscow',
+                                           select => "Id,CreatedDate,FailureDate,ConnectionFailureEnumValue,SessionKey",
+                                           );
+
+foreach my $item ( @ConnectionFailureLogs ) {
+  $work{failure}{$item->{Id}}{SessionKey}                 = $item->{SessionKey};
+  $work{failure}{$item->{Id}}{CreatedDate}                = $item->{CreatedDate};
+  $work{failure}{$item->{Id}}{ModifiedDate}               = $item->{ModifiedDate};
+  $work{failure}{$item->{Id}}{FailureDate}                = $item->{FailureDate};
+  $work{failure}{$item->{Id}}{ConnectionFailureEnumValue} = $item->{ConnectionFailureEnumValue};
+  $work{failure}{$item->{Id}}{ConnectionFailureEnumName}  = $citrix->{cache}->{enum}{SessionFailureCode}{ $item->{ConnectionFailureEnumValue} };
+  }
+
+
+if ( ! defined $work{failure} ) {
+  foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+    $work{sender}{ $citrix->{cache}->{dg}{$Id}->{zabbix_host} }{env}{UserLog}->{value} = "";
+    }
+  z_sender::zabbix_sender( %work );
+  exit;
+  }
+
+foreach my $failure_Id ( keys $work{failure} ) {
+  my $SessionKey = $work{failure}{ $failure_Id }{SessionKey};
+  if ( ! defined $work{session_failure}{$SessionKey}{CreatedDate} ) {
+    my @Sessions = $citrix->Get ( sets => "Sessions", filter => { SessionKey => $SessionKey, }, select => "SessionKey,MachineId,SessionType,CreatedDate,FailureDate,SessionType,UserId", );
+    foreach my $item ( @Sessions ) {
+      my $SessionKey = $item->{SessionKey};
+      $work{session_failure}{$SessionKey}{CreatedDate}            = $item->{CreatedDate};
+      $work{session_failure}{$SessionKey}{FailureDate}            = $item->{FailureDate};
+      $work{session_failure}{$SessionKey}{FailureDate_unixtime}   = $item->{FailureDate_unixtime}; 
+      $work{session_failure}{$SessionKey}{MachineId}              = $item->{MachineId};
+      $work{session_failure}{$SessionKey}{SessionType}            = $item->{SessionType};
+      $work{session_failure}{$SessionKey}{UserId}                 = $item->{UserId};
+      $work{session_failure}{$SessionKey}{User}                   = $citrix->{cache}->{users}{ $item->{UserId} }->{UserName};
+      $work{session_failure}{$SessionKey}{Machine}                = $citrix->{cache}->{machines}{$item->{MachineId}}->{HostedMachineName};
+      $work{session_failure}{$SessionKey}{DesktopGroupId}         = $citrix->{cache}->{machines}{$item->{MachineId}}->{DesktopGroupId};
+      $work{session_failure}{$SessionKey}{DesktopGroupName}       = $citrix->{cache}->{dg}{$work{session_failure}{$SessionKey}{DesktopGroupId}}{Name};
+      $work{session_failure}{$SessionKey}{zabbix_host}            = $citrix->{cache}->{dg}{$work{session_failure}{$SessionKey}{DesktopGroupId}}{zabbix_host};
+      $work{session_failure}{$SessionKey}{SessionTypeName}        = $citrix->{cache}->{enum}{SessionType}{ $item->{SessionType} };
+      $work{session_failure}{$SessionKey}{ConnectionFailureValue} = $work{failure}{$failure_Id}{ConnectionFailureEnumValue};
+      $work{session_failure}{$SessionKey}{ConnectionFailureName}  = $work{failure}{$failure_Id}{ConnectionFailureEnumName};
+
+      # не найден FailureDate, значит нет смысла с сессией работать, она случайно попала
+      if ( ! defined $work{session_failure}{$SessionKey}{FailureDate} ) {
+        $work{session_failure}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      # Не найден DesktopGroupId
+      if ( ! defined $work{session_failure}{$SessionKey}{DesktopGroupId} ) {
+        $work{session_failure}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+      # Не найден zabbix_host
+      if ( ! defined $work{session_failure}{$SessionKey}{zabbix_host} ) {
+        $work{session_failure}{$SessionKey}{delete} = 1;
+        $work{failure}{$failure_Id}{delete} = 1;
+        }
+
+      }
+    }
+  }
+
+# Уберем лишнее failure
+foreach my $failure_Id ( keys $work{failure} ) {
+  if ( defined $work{failure}{$failure_Id}{delete} ) {
+    delete $work{failure}{$failure_Id};
+    }
+  }
+# Уберем лишнее session
+foreach my $SessionKey ( keys $work{session_failure} ) {
+  if ( defined $work{session_failure}{$SessionKey}{delete} ) {
+    delete $work{session_failure}{$SessionKey};
+    }
+  }
+
+
+if ( ! defined $work{session_failure} ) {
+  foreach my $Id ( keys $citrix->{cache}->{dg} ) {
+    $work{sender}{ $citrix->{cache}->{dg}{$Id}->{zabbix_host} }{env}{UserLog}->{value} = "";
+    }
+  z_sender::zabbix_sender( %work );
+  exit;
+  }
+
+
+# Получим Connections по интересным для нас сессиям
+foreach my $SessionKey ( keys $work{session_failure} ) {
+  my @Connections = $citrix->Get ( sets => "Connections", filter => { SessionKey => $SessionKey }, select => "Id,SessionKey,LogOnStartDate,LogOnEndDate,EstablishmentDate,DisconnectCode,DisconnectDate,CreatedDate,ClientName,ClientVersion,ClientAddress", );
+  foreach my $item ( @Connections ) {
+    my $Id = $item->{Id};
+    foreach my $i ( keys %{$item} ) {
+      if ( defined $item->{ $i } ) {
+        $work{connection}{ $Id }{ $i } = $item->{$i};
+        }
+      }
+    push @{ $work{session_failure}{$SessionKey}{connection} }, $Id;
+    }
+  }
+
+# Соберем ClientName ClientVersion и ClientAddress в сессиии
+foreach my $SessionKey ( keys $work{session_failure} ) {
+
+  if ( defined $work{session_failure}{$SessionKey}{connection} ) {
+    my @connection = @{$work{session_failure}{$SessionKey}{connection}};
+    foreach my $Id ( @connection ) {
+      my $ClientName    = $work{connection}{ $Id }{ClientName};
+      my $ClientVersion = $work{connection}{ $Id }{ClientVersion};
+      my $ClientAddress = $work{connection}{ $Id }{ClientAddress};
+
+      if ( defined $ClientName and $ClientName !~ /^WR\_.*/ ) {
+        if ( ! defined $work{session_failure}{$SessionKey}{ClientName} ) {
+          $work{session_failure}{$SessionKey}{ClientName} = $ClientName;
+          }
+        if ( defined $work{session_failure}{$SessionKey}{ClientName} and $work{session_failure}{$SessionKey}{ClientName} ne $ClientName ) {
+          $work{session_failure}{$SessionKey}{ClientName} = "$work{session_failure}{$SessionKey}{ClientName}; $ClientName"
+          }
+        }
+
+      if ( defined $ClientVersion ) {
+        if ( ! defined $work{session_failure}{$SessionKey}{ClientVersion} ) {
+          $work{session_failure}{$SessionKey}{ClientVersion} = $ClientVersion;
+          }
+        if ( defined $work{session_failure}{$SessionKey}{ClientVersion} and $work{session_failure}{$SessionKey}{ClientVersion} ne $ClientVersion ) {
+          $work{session_failure}{$SessionKey}{ClientVersion} = "$work{session_failure}{$SessionKey}{ClientVersion}; $ClientVersion"
+          }
+        }
+
+      if ( defined $ClientAddress ) {
+        if ( ! defined $work{session_failure}{$SessionKey}{ClientAddress} ) {
+          $work{session_failure}{$SessionKey}{ClientAddress} = $ClientAddress;
+          }
+        if ( defined $work{session_failure}{$SessionKey}{ClientVersion} and $work{session_failure}{$SessionKey}{ClientAddress} ne $ClientAddress ) {
+          $work{session_failure}{$SessionKey}{ClientAddress} = "$work{session_failure}{$SessionKey}{ClientAddress}; $ClientAddress"
+          }
+        }
+      }
+    }
+  }
+
+foreach my $SessionKey ( keys $work{session_failure} ) {
+
+  if ( defined $work{session_failure}{$SessionKey}{connection} ) {
+    my @connection = @{$work{session_failure}{$SessionKey}{connection}};
+    foreach my $Id ( @connection ) {
+      my $ClientName    = $work{session_failure}{$SessionKey}{ClientName};
+      my $ClientVersion = $work{session_failure}{$SessionKey}{ClientVersion};
+      my $ClientAddress = $work{session_failure}{$SessionKey}{ClientAddress};
+      my $ClientSTR = "";
+
+      if (   defined $ClientName and   defined $ClientAddress ) { $ClientSTR = "host=$ClientName $ClientAddress;";  }
+      if ( ! defined $ClientName and   defined $ClientAddress ) { $ClientSTR = "ip=$ClientAddress;";    }
+      if (   defined $ClientName and ! defined $ClientAddress ) { $ClientSTR = "host=$ClientName;";     }
+
+      $work{session_failure}{$SessionKey}{ClientSTR} = $ClientSTR;
+      }
+    }
+  }
+
+# Соберем FailureDate по удобнее
+foreach my $SessionKey ( keys $work{session_failure} ) {
+  my $FailureDate_unixtime = $work{session_failure}{$SessionKey}{FailureDate_unixtime};
+  my $dt = DateTime->from_epoch( epoch => $FailureDate_unixtime )->set_time_zone( 'Europe/Moscow' );
+  $work{session_failure}{$SessionKey}{FailureDate_time} = $dt->strftime("%T");
+  $work{session_failure}{$SessionKey}{FailureDate_date} = $dt->strftime("%F");
+  }
+
+# Соберем connection в сесии
+foreach my $SessionKey ( keys $work{session_failure} ) {
+  $work{session_failure}{$SessionKey}{connection_num} = 0;
+  if ( defined $work{session_failure}{$SessionKey}{connection} ) {
+    my @connection = @{$work{session_failure}{$SessionKey}{connection}};
+    foreach my $Id ( @connection ) {
+      $work{session_failure}{$SessionKey}{connection_num}++;
+      }
+    }
+  }
+
+
+# Зальем в итоговую структурку $work{summ} для завершения процесса формирования отчета сбойных сессиий
+foreach my $SessionKey ( keys $work{session_failure} ) {
+  my $User                   = $work{session_failure}{$SessionKey}{User};
+  my $UserId                 = $work{session_failure}{$SessionKey}{UserId};
+  my $zabbix_host            = $work{session_failure}{$SessionKey}{zabbix_host};
+  my $DesktopGroupId         = $work{session_failure}{$SessionKey}{DesktopGroupId};
+  my $ConnectionFailureName  = $work{session_failure}{$SessionKey}{ConnectionFailureName};
+  if ( ! defined $zabbix_host ) { next; }
+  if ( ! defined $ConnectionFailureName ) { next; }
+  $work{summ}{$DesktopGroupId}{zabbix_host} = $zabbix_host;
+  $work{summ}{$DesktopGroupId}{User}{$UserId}{User} = $User;
+  $work{summ}{$DesktopGroupId}{User}{$UserId}{session_failure}{$SessionKey} = 1;
+  }
+
+
+# Обратимся с запросом об активных сессиях
+
+foreach my $DesktopGroupId ( keys $work{summ} ) {
+  my $zabbix_host = $work{summ}{$DesktopGroupId}{zabbix_host};
+  foreach my $UserId ( keys $work{summ}{$DesktopGroupId}{User} ) {
+    my $User = $work{summ}{$DesktopGroupId}{User}{$UserId}{User};
+    my @session_now = $citrix->Get ( sets => "Sessions",
+                                     filter => { UserId => $UserId, CreatedDate_last => $all_last, failuredate_null => 1, enddate_null => 1, },
+                                     select => "SessionKey,UserId,MachineId,SessionType,CurrentConnectionId,CreatedDate,StartDate,EndDate,FailureDate",
+                                    );
+
+    foreach my $item ( @session_now ) {
+      my $SessionKey           = $item->{SessionKey};
+      my $MachineId            = $item->{MachineId};
+      my $Machine              = $citrix->{cache}->{machines}{ $MachineId }->{HostedMachineName};
+      my $DesktopGroupId       = $citrix->{cache}->{machines}{ $MachineId }->{DesktopGroupId};
+      my $DesktopGroupName     = $citrix->{cache}->{dg}{ $DesktopGroupId }{Name};
+      my $zabbix_host          = $citrix->{cache}->{dg}{ $DesktopGroupId }{zabbix_host};
+      my $SessionType          = $item->{SessionType};
+      my $SessionTypeName      = $citrix->{cache}->{enum}{SessionType}{ $SessionType };
+      my $CurrentConnectionId  = $item->{CurrentConnectionId};
+      my $CreatedDate          = $item->{CreatedDate};
+      my $CreatedDate_unixtime = $item->{CreatedDate_unixtime};
+
+      my $dt1 = DateTime->from_epoch( epoch => $CreatedDate_unixtime )->set_time_zone( 'Europe/Moscow' );
+      my $CreatedDate_time = $dt1->strftime("%T");
+      my $CreatedDate_date = $dt1->strftime("%F");
+
+      my @Connections = $citrix->Get ( sets => "Connections",
+                                       filter => { SessionKey => $SessionKey, disconnectdate_null => 1, },
+                                       select => "Id,LogOnStartDate,DisconnectDate",
+                                     );
+
+      foreach my $Connect ( @Connections ) {
+        my $Id             = $Connect->{Id};
+        my $LogOnStartDate = $Connect->{LogOnStartDate};
+        my $DisconnectDate = $Connect->{DisconnectDate};
+        if ( ! defined $DisconnectDate and defined $work{summ}{$DesktopGroupId} ) {
+          $work{session_now}{$SessionKey}{MachineId}           = $MachineId;
+          $work{session_now}{$SessionKey}{Machine}             = $Machine;
+          $work{session_now}{$SessionKey}{DesktopGroupId}      = $DesktopGroupId ;
+          $work{session_now}{$SessionKey}{DesktopGroupName}    = $DesktopGroupName;
+          $work{session_now}{$SessionKey}{zabbix_host}         = $zabbix_host;
+          $work{session_now}{$SessionKey}{SessionType}         = $SessionType;
+          $work{session_now}{$SessionKey}{SessionTypeName}     = $SessionTypeName;
+          $work{session_now}{$SessionKey}{CurrentConnectionId} = $CurrentConnectionId;
+          $work{session_now}{$SessionKey}{CreatedDate}         = $CreatedDate;
+          $work{session_now}{$SessionKey}{CreatedDate_time}    = $CreatedDate_time;
+          $work{session_now}{$SessionKey}{CreatedDate_date}    = $CreatedDate_date;
+
+          $work{summ}{$DesktopGroupId}{User}{$UserId}{session_now}{$SessionKey} = 1;
+          }
+        }
+      }
+    }
+  }
+
+
+foreach my $DesktopGroupId ( keys $work{summ} ) {
+  my $zabbix_host = $work{summ}{$DesktopGroupId}{zabbix_host};
+  my $txt = "";
+
+  foreach my $UserId ( keys $work{summ}{$DesktopGroupId}{User} ) {
+    my $User = $work{summ}{$DesktopGroupId}{User}{$UserId}{User};
+    $txt .= "$User\\n";
+
+    if ( defined $work{summ}{$DesktopGroupId}{User}{$UserId}{session_failure} ) {
+      foreach my $SessionKey ( keys $work{summ}{$DesktopGroupId}{User}{$UserId}{session_failure} ) {
+        my $FailureDate_time       = $work{session_failure}{$SessionKey}{FailureDate_time};
+        my $FailureDate_date       = $work{session_failure}{$SessionKey}{FailureDate_date};
+        my $Machine                = $work{session_failure}{$SessionKey}{Machine};
+        my $SessionTypeName        = $work{session_failure}{$SessionKey}{SessionTypeName};
+        my $ConnectionFailureValue = $work{session_failure}{$SessionKey}{ConnectionFailureValue};
+        my $ClientSTR              = $work{session_failure}{$SessionKey}{ClientSTR};
+        my $connection_num         = $work{session_failure}{$SessionKey}{connection_num};
+        $txt .= "  faild [$FailureDate_time] $Machine $SessionTypeName connect($connection_num) $ClientSTR\\n";
+        }
+      }
+
+
+    if ( defined $work{summ}{$DesktopGroupId}{User}{$UserId}{session_now} ) {
+      foreach my $SessionKey ( keys $work{summ}{$DesktopGroupId}{User}{$UserId}{session_now} ) {
+        my $CreatedDate_time = $work{session_now}{$SessionKey}{CreatedDate_time};
+        my $CreatedDate_date = $work{session_now}{$SessionKey}{CreatedDate_date};
+        my $Machine          = $work{session_now}{$SessionKey}{Machine};
+        my $SessionTypeName  = $work{session_now}{$SessionKey}{SessionTypeName};
+        $txt .= "  works [$CreatedDate_time] $Machine $SessionTypeName\\n";
+        }
+      }
+    else {
+      $txt .= "  NO WORKS!\\n";
+      }
+    }
+  $work{sender}{$zabbix_host}{env}{UserLog}->{value}=$txt;
+  }
+
+z_sender::zabbix_sender( %work );
+
